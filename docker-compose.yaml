@@ -1,0 +1,198 @@
+services:
+  postgres:
+    image: postgis/postgis:17-3.5
+    container_name: postgres_postgis
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -d swipesight -U admin" ]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init-scripts:/docker-entrypoint-initdb.d/
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    ports:
+      - "8888:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    user: root
+    entrypoint: /bin/sh -c "chmod 600 /pgpass; /entrypoint.sh;"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    volumes:
+      - ./pgadmin/pgpass:/pgpass
+      - ./pgadmin/servers.json:/pgadmin4/servers.json
+
+  api_gateway:
+    build: api_gateway
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    container_name: "api_gateway"
+    healthcheck:
+      test: "curl -f http://localhost:3000/health || exit 1"
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    ports:
+      - "3000:3000"
+      - "3002:3002"
+    command: npm run dev
+    environment:
+      KAFKAJS_NO_PARTITIONER_WARNING: 1
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      KAFKA_BROKER: kafka:9093
+
+  user_simulator:
+    build: user_simulator
+    container_name: user_simulator
+    depends_on:
+      api_gateway:
+        condition: service_healthy
+    environment:
+      API_HOST: api_gateway
+      TOTAL_USERS: 10
+      TOTAL_CITIES: 10
+      SWIPES_PER_USER: 1000
+      SWIPES_PER_CITY: 100
+      ALLOW_FAST_SEND: false
+
+  kafka:
+    image: apache/kafka:latest
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: "nc -z localhost 9092 || exit 1"
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    environment:
+      # Configure listeners for both docker and host communication
+      KAFKA_LISTENERS: CONTROLLER://localhost:9091,HOST://0.0.0.0:9092,DOCKER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: HOST://localhost:9092,DOCKER://kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,DOCKER:PLAINTEXT,HOST:PLAINTEXT
+
+      # Settings required for KRaft mode
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9091
+
+      # Listener to use for broker-to-broker communication
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+
+      # Required for a single node cluster
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  kafka_ui:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    container_name: kafka_ui
+    ports:
+      - "8080:8080"
+    environment:
+      DYNAMIC_CONFIG_ENABLED: "true"
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9093
+    depends_on:
+      - kafka
+
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    depends_on:
+      kafka:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+  jobmanager:
+    image: flink:latest
+    ports:
+      - "8081:8081"
+    command: /opt/flink/scripts/start_flink_job.sh
+    volumes:
+      - ./flink/jars:/opt/flink/jobs/
+      - ./flink/scripts:/opt/flink/scripts/
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9093
+      - DATABASE_HOST=postgres:5432
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+
+  taskmanager:
+    image: flink:latest
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    scale: 1
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9093
+      - DATABASE_HOST=postgres:5432
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2  
+
+  influxdb2:
+    image: influxdb:2
+    container_name: influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_INIT_USERNAME}
+      DOCKER_INFLUXDB_INIT_PASSWORD:  ${INFLUXDB_INIT_PASSWORD}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN:  ${INFLUXDB_INIT_ADMIN_TOKEN}
+      DOCKER_INFLUXDB_INIT_ORG: docs
+      DOCKER_INFLUXDB_INIT_BUCKET: home
+    volumes:
+      - type: volume
+        source: influxdb2-data
+        target: /var/lib/influxdb2
+      - type: volume
+        source: influxdb2-config
+        target: /etc/influxdb2
+
+  telegraf:
+      image: telegraf:1.31
+      container_name: telegraf
+      depends_on:
+        kafka:
+          condition: service_healthy
+        influxdb2:
+          condition: service_started
+      environment:
+        INFLUX_TOKEN: ${INFLUX_TOKEN}
+      volumes:
+        - ./telegraf/kafka_config.conf:/etc/telegraf/telegraf.conf:ro
+
+volumes:
+  pgdata:
+  grafana-storage:
+  influxdb2-data:
+  influxdb2-config:
